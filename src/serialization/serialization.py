@@ -33,12 +33,12 @@ def get_graph_vertex_order(adjacency_matrix=None, method='dfs', num_nodes=472):
     else:
         order = torch.arange(num_nodes, dtype=torch.long)
 
-    # Return with batch/curve dimension [1, P]
+
     return order.unsqueeze(0)
 
 
 if __name__ == '__main__':
-    # Quick test
+   
     order_tensor = get_graph_vertex_order(method='dfs', num_nodes=472)
     print("Graph vertex order tensor shape:", order_tensor.shape)
     print("First 10 indices:", order_tensor[0, :10])
