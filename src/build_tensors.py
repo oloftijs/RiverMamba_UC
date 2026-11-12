@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Turn the per-day parquet files from preprocess.py into:
-  * tensors.npz        station x time delay tensor (mean delay per bin) + mask + counts
-  * events.parquet     filtered stop events with split / bin / node columns
-  * splits.json        which days went to train / val / test
-  * baseline_results.csv, baseline_by_route.csv   the three trivial baselines
+- tensors.npz        station x time delay tensor (mean delay per bin) + mask + counts
+- events.parquet     filtered stop events with split / bin / node columns
+- splits.json        which days went to train / val / test
+- baseline_results.csv, baseline_by_route.csv   the three trivial baselines
 
 Usage:
-    python build_tensors.py --proc-dir processed --out tensors_out
+    python build_tensors.py --proc-dir processed --out tensors_out --seed 42
 
 Task used for the baselines (event level, so per-line results are possible):
   For every stop event (a train arriving at a station with delay y), forecast y
@@ -17,8 +17,8 @@ Task used for the baselines (event level, so per-line results are possible):
                    the forecast origin, if seen within --lookback-min, else 0
     historical   : mean train delay for (station, time-of-day slot, weekday/weekend)
                    computed on the training days only
-Splits are chronological over whole local days (not random), so test days lie after
-train days. Days with very few events (edge effects) are dropped before splitting.
+Splits are randomized over whole local days using --seed. Days with very few events
+(edge effects) are dropped before splitting.
 Filtering (thresholds are judgement calls, report them): trips whose median delay is
 outside [trip-lo, trip-hi] and single stops outside [stop-lo, stop-hi] are dropped.
 """
@@ -128,6 +128,7 @@ def main():
     ap.add_argument("--trip-hi", type=float, default=3600)
     ap.add_argument("--stop-lo", type=float, default=-1800)
     ap.add_argument("--stop-hi", type=float, default=7200)
+    ap.add_argument("--seed", type=int, default=42, help="random seed for day-level train/val/test split")
     a = ap.parse_args()
     assert 1440 % a.bin_min == 0, "--bin-min must divide 1440"
     out = Path(a.out)
@@ -153,9 +154,14 @@ def main():
     n_test = n_val
     n_train = len(days) - n_val - n_test
     names = ["train"] * n_train + ["val"] * n_val + ["test"] * n_test
-    day2split = dict(zip(days, names))
+
+    rng = np.random.default_rng(a.seed)
+    shuffled_days = rng.permutation(days).tolist()
+    day2split = dict(zip(shuffled_days, names))
     ev["split"] = ev["didx"].map(day2split)
-    print({s: [int(d) for d, n in day2split.items() if n == s] for s in ("train", "val", "test")})
+
+    split_days = {s: sorted(int(d) for d, n in day2split.items() if n == s) for s in ("train", "val", "test")}
+    print(split_days)
 
     delay, mask, count, stations = build_tensor(ev, int(max(days)) + 1, bpd, bin_sec, t0)
     print(f"tensor {delay.shape} (time x stations), {mask.mean():.2%} of cells observed")
@@ -163,9 +169,8 @@ def main():
                         stations=stations, t0=t0, bin_min=a.bin_min)
     ev.to_parquet(out / "events.parquet", index=False)
     with open(out / "splits.json", "w") as f:
-        json.dump({"day_index_from_t0": {s: [int(d) for d, n in day2split.items() if n == s]
-                                         for s in ("train", "val", "test")},
-                   "t0_naive_local_epoch": float(t0), "bins_per_day": bpd}, f, indent=1)
+        json.dump({"day_index_from_t0": split_days,
+                   "t0_naive_local_epoch": float(t0), "bins_per_day": bpd, "seed": a.seed}, f, indent=1)
 
     last = last_observed_index(mask)
     train = ev[ev["split"] == "train"]

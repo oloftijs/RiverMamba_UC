@@ -7,35 +7,10 @@ Usage:
     python preprocess.py --rt-dir data/ --gtfs-dir gtfs_archive/ --out processed/
     python preprocess.py --rt-dir data/ --gtfs-dir gtfs_archive/ --out processed/ \
         --start 2024-01-01 --end 2024-01-31
-
-Inputs
-  --rt-dir    folder with files whose names contain the day (YYYY-MM-DD) and
-              'trips' or 'stop_times' (csv or csv.gz, subfolders are searched)
-  --gtfs-dir  folder produced by download_gtfs_archive.py (zips + version_for_day.json)
-
-How the join works
-  1. A realtime trip_id like '030100_4..N01R' is split into origin code, route,
-     direction and path. Static trip_ids carry an extra prefix
-     ('AFA23GEN-1037-Weekday-00_030100_4..N01R'), so we match on route and
-     direction, then pick scheduled trips whose origin time is within --tol
-     seconds (origin codes in the realtime feed are often a few seconds off).
-  2. Candidate static trips must be active on the day, or on the day before
-     (post-midnight trips belong to the previous service day).
-  3. A candidate is only kept if the realtime start_time agrees with the
-     scheduled origin time (within --tol seconds). This also settles the
-     service-day question and catches timezone mistakes.
-  4. Among candidates, the one sharing the most stops with the realtime trip wins.
-  5. Stops are joined on (static trip, stop_id). delay = actual - scheduled.
-
-Timestamps: subwaydata.nyc timestamps look like local wall-clock time stored as
-Unix seconds. --tz auto checks this against the trip_id origin times.
-Everything in the output is 'naive local seconds' (no timezone). Known
-simplification: on DST change days the schedule can be off by one hour.
-
-Not tested against your real files. Check the printed match rates first.
 """
 import argparse
 import json
+import os
 import re
 import sys
 import zipfile
@@ -43,10 +18,34 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 EPOCH = pd.Timestamp("1970-01-01")
 KEY_RE = r"(?P<origin>\d{6})_(?P<route>[^._]+)\.{1,2}(?P<dir>[NS])(?P<path>[A-Za-z0-9]*)$"
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+TRIPS_DTYPES = {
+    "trip_uid": str,
+    "trip_id": str,
+    "route_id": str,
+    "direction_id": str,
+}
+ST_DTYPES = {
+    "trip_uid": str,
+    "stop_id": str,
+    "track": str,
+}
+STRING_OUT_COLS = (
+    "trip_uid",
+    "stop_id",
+    "track",
+    "trip_id",
+    "route_id",
+    "direction_id",
+    "static_trip_id",
+    "station",
+    "day",
+)
 
 
 # ----------------------------------------------------------------- helpers
@@ -70,6 +69,17 @@ def hms_to_sec(s):
 
 def midnight_sec(d):
     return (pd.Timestamp(d) - EPOCH).total_seconds()
+
+
+def is_fully_processed(out_path):
+    """Return True only if out_path exists, is non-empty, and has a valid Parquet footer with rows."""
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return False
+    try:
+        pf = pq.ParquetFile(out_path)
+        return pf.metadata is not None and pf.metadata.num_rows > 0
+    except Exception:
+        return False
 
 
 # ------------------------------------------------------------ static GTFS
@@ -106,8 +116,6 @@ def load_static(zip_path):
     origin_sec = st.groupby("trip_id")["dep"].first()
 
     trips = pd.concat([trips, trips["trip_id"].str.extract(KEY_RE)], axis=1)
-    # the route letter inside a static trip_id is the physical line (W trips say 'N'),
-    # so use the route_id column, which holds the service name the realtime feed uses
     trips["route"] = trips["route_id"]
     trips["origin_sec_sched"] = trips["trip_id"].map(origin_sec)
     trips = trips.dropna(subset=["origin", "origin_sec_sched"])
@@ -170,14 +178,11 @@ def detect_stop_tz(trips, st, trips_mode):
 
 
 # ------------------------------------------------------------- per-day work
-def process_day(day, trips_path, st_path, static, mode, tol, st_mode):
-    trips = pd.read_csv(trips_path).drop_duplicates("trip_uid")
-    st = pd.read_csv(st_path)
-
+def process_day(day, trips, st, static, mode, tol, st_mode):
     trips = trips.reset_index(drop=True)
+    st = st.copy()
+
     trips["start_local"] = to_local_sec(trips["start_time"], mode)
-    # start_time can carry the wrong date for trips around midnight (seen: exactly
-    # 24 h too late). Keep its time of day, but take the date from the first departure.
     first_dep = (
         st.dropna(subset=["departure_time"]).drop_duplicates("trip_uid")
         .set_index("trip_uid")["departure_time"]
@@ -260,9 +265,7 @@ def process_day(day, trips_path, st_path, static, mode, tol, st_mode):
     df["event_time"] = EPOCH + pd.to_timedelta(df["event_sec"], unit="s")
     df["day"] = day.isoformat()
 
-    # The same train can appear as two trip_uids with the same start prefix (one with a
-    # path suffix, one without). Flag every record except the longest one of each run.
-    run = df["trip_uid"].str.split("_").str[0] + "|" + df["route_id"].astype(str) + "|" + df["direction_id"].astype(str)
+    run = df["trip_uid"].str.split("_").str[0] + "|" + df["route_id"].fillna("") + "|" + df["direction_id"].fillna("")
     rank = pd.DataFrame({
         "run": run, "trip_uid": df["trip_uid"],
         "n": df.groupby("trip_uid")["stop_id"].transform("size"),
@@ -270,6 +273,11 @@ def process_day(day, trips_path, st_path, static, mode, tol, st_mode):
     }).drop_duplicates("trip_uid")
     primary = set(rank.sort_values(["n", "L"], ascending=False).drop_duplicates("run")["trip_uid"])
     df["secondary_record"] = ~df["trip_uid"].isin(primary)
+
+    # Enforce uniform nullable string schema across all text/ID columns for PyArrow
+    for col in STRING_OUT_COLS:
+        if col in df.columns:
+            df[col] = df[col].astype("string")
 
     n_trips = df["trip_uid"].nunique()
     stats = {
@@ -342,9 +350,12 @@ def main():
     all_stats = []
     for day in days:
         out_path = out_dir / f"delays_{day}.parquet"
-        if out_path.exists() and not args.overwrite:
-            print(f"{day}: exists, skipping")
+        if not args.overwrite and is_fully_processed(out_path):
+            print(f"{day}: already processed, skipping")
             continue
+        if out_path.exists() and not args.overwrite:
+            print(f"{day}: found incomplete/corrupt parquet, reprocessing")
+
         tp, sp = find_file(rt_dir, day, "trips"), find_file(rt_dir, day, "stop_times")
         zname = version_for_day.get(day.isoformat())
         if not (tp and sp):
@@ -353,16 +364,26 @@ def main():
         if not zname:
             print(f"{day}: no static GTFS version mapped, skipping")
             continue
+
         print(f"{day}:")
+        trips_df = pd.read_csv(tp, dtype=TRIPS_DTYPES).drop_duplicates("trip_uid")
+        st_df = pd.read_csv(sp, dtype=ST_DTYPES)
+
         if mode == "auto":
-            mode = detect_tz(pd.read_csv(tp).drop_duplicates("trip_uid"))
+            mode = detect_tz(trips_df)
             print(f"  using tz mode '{mode}' for all days")
         static = load_static(gtfs_dir / zname)
         if st_mode == "auto":
-            st_mode = detect_stop_tz(pd.read_csv(tp).drop_duplicates("trip_uid"), pd.read_csv(sp), mode)
+            st_mode = detect_stop_tz(trips_df, st_df, mode)
             print(f"  using stop_times tz mode '{st_mode}' for all days")
-        df, stats = process_day(day, tp, sp, static, mode, args.tol, st_mode)
-        df.to_parquet(out_path, index=False)
+
+        df, stats = process_day(day, trips_df, st_df, static, mode, args.tol, st_mode)
+
+        # Atomic write so interrupted runs never leave partial files
+        tmp_path = out_path.with_suffix(".parquet.tmp")
+        df.to_parquet(tmp_path, index=False)
+        os.replace(tmp_path, out_path)
+
         all_stats.append(stats)
         print(
             f"  {stats['trips']} trips, trip match {stats['trip_match_rate']:.1%}, "
@@ -371,9 +392,16 @@ def main():
         )
 
     if all_stats:
-        summary = pd.DataFrame(all_stats)
-        summary.to_csv(out_dir / "summary.csv", index=False)
-        print(f"\nWrote summary.csv. Lowest trip match rate: {summary['trip_match_rate'].min():.1%}")
+        new_summary = pd.DataFrame(all_stats)
+        summary_path = out_dir / "summary.csv"
+        if summary_path.exists() and not args.overwrite:
+            old_summary = pd.read_csv(summary_path)
+            old_summary = old_summary[~old_summary["day"].isin(new_summary["day"])]
+            summary = pd.concat([old_summary, new_summary], ignore_index=True).sort_values("day")
+        else:
+            summary = new_summary.sort_values("day")
+        summary.to_csv(summary_path, index=False)
+        print(f"\nWrote summary.csv ({len(summary)} total days). Lowest trip match rate: {summary['trip_match_rate'].min():.1%}")
 
 
 if __name__ == "__main__":
