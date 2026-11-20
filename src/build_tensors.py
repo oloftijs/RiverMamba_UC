@@ -120,7 +120,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--proc-dir", default="processed")
     ap.add_argument("--out", default="tensors_out")
-    ap.add_argument("--bin-min", type=int, default=2)
+    ap.add_argument("--bin-min", type=int, default=1)
     ap.add_argument("--hist-bin-min", type=int, default=30, help="time-of-day slot for the historical baseline")
     ap.add_argument("--horizon-min", type=float, default=10)
     ap.add_argument("--lookback-min", type=float, default=30)
